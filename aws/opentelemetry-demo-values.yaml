@@ -1,0 +1,199 @@
+# AWS CloudWatch Configuration for OpenTelemetry Demo
+# This file configures the demo to send telemetry to BOTH AWS CloudWatch and built-in monitoring tools
+# Based on GCP implementation pattern
+
+# Enable built-in monitoring tools for local visualization
+prometheus:
+  enabled: true
+grafana:
+  enabled: true
+opensearch:
+  enabled: true
+jaeger:
+  enabled: true
+
+components:
+  # Expose frontend via AWS LoadBalancer
+  frontend-proxy:
+    service:
+      type: LoadBalancer
+      annotations:
+        # Optional: Use internal load balancer
+        # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        # Optional: Use NLB instead of CLB
+        # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+opentelemetry-collector:
+  # Service account for IRSA (IAM Roles for Service Accounts)
+  # Note: The service account is created by eksctl with proper IAM role annotation
+  # Do NOT create it again in Helm or deployment will fail
+  serviceAccount:
+    create: false
+    name: "opentelemetry-demo-otelcol"
+    # The IAM role ARN annotation is automatically added by eksctl
+
+  command:
+    extraArgs: []
+
+  alternateConfig:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            cors:
+              allowed_origins:
+              - "http://*"
+              - "https://*"
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 65
+        spike_limit_percentage: 20
+
+      batch:
+        send_batch_max_size: 200
+        send_batch_size: 200
+        timeout: 5s
+
+      # AWS resource detection
+      resourcedetection:
+        detectors: [env, eks, ec2]
+        timeout: 10s
+        override: false
+
+      # Add resource attributes for better identification
+      resource:
+        attributes:
+        - action: insert
+          from_attribute: k8s.pod.uid
+          key: service.instance.id
+        - action: insert
+          key: deployment.environment
+          value: "demo"
+
+      # Filter out high-frequency metrics (similar to GCP implementation)
+      filter/too_frequent:
+        metrics:
+          metric:
+          - '(IsMatch(name, "(.*)app_currency(.*)")) or (resource.attributes["service.name"] == "flagd")'
+
+      # Transform processor to handle attribute name collisions
+      # AWS services may have reserved attribute names that conflict with OTel conventions
+      transform/collision:
+        metric_statements:
+        - context: datapoint
+          statements:
+          - set(attributes["exported_location"], attributes["location"]) where attributes["location"] != nil
+          - delete_key(attributes, "location") where attributes["location"] != nil
+          - set(attributes["exported_cluster"], attributes["cluster"]) where attributes["cluster"] != nil
+          - delete_key(attributes, "cluster") where attributes["cluster"] != nil
+          - set(attributes["exported_namespace"], attributes["namespace"]) where attributes["namespace"] != nil
+          - delete_key(attributes, "namespace") where attributes["namespace"] != nil
+          - set(attributes["exported_job"], attributes["job"]) where attributes["job"] != nil
+          - delete_key(attributes, "job") where attributes["job"] != nil
+          - set(attributes["exported_instance"], attributes["instance"]) where attributes["instance"] != nil
+          - delete_key(attributes, "instance") where attributes["instance"] != nil
+
+    exporters:
+      # CloudWatch Logs exporter using OTLP HTTP
+      otlphttp/logs:
+        compression: gzip
+        logs_endpoint: https://logs.us-west-2.amazonaws.com/v1/logs
+        headers: 
+          x-aws-log-group: /aws/otel-demo/application
+          x-aws-log-stream: default
+        auth:
+          authenticator: sigv4auth/logs
+      
+      # AWS X-Ray traces exporter using OTLP HTTP
+      otlphttp/traces:
+        compression: gzip
+        traces_endpoint: https://xray.us-west-2.amazonaws.com/v1/traces
+        auth:
+          authenticator: sigv4auth/traces
+
+      # CloudWatch metrics exporter using EMF (Embedded Metric Format)
+      # Disabled to reduce CloudWatch costs - metrics only in Prometheus
+      # awsemf:
+      #   region: us-west-2
+      #   log_group_name: /aws/otel-demo/metrics
+      #   namespace: OtelDemo
+      #   dimension_rollup_option: NoDimensionRollup
+      #   resource_to_telemetry_conversion:
+      #     enabled: true
+
+      # Built-in monitoring tool exporters
+      # Jaeger for traces
+      otlp/jaeger:
+        endpoint: 'jaeger:4317'
+        tls:
+          insecure: true
+
+      # OpenSearch for logs
+      opensearch:
+        logs_index: otel
+        http:
+          endpoint: 'http://opensearch:9200'
+          tls:
+            insecure: true
+
+      # Prometheus for metrics
+      prometheus:
+        endpoint: 0.0.0.0:9464
+
+    extensions:
+      # SigV4 authentication for CloudWatch Logs
+      sigv4auth/logs:
+        region: "us-west-2"
+        service: "logs"
+      
+      # SigV4 authentication for X-Ray
+      sigv4auth/traces:
+        region: "us-west-2"
+        service: "xray"
+
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    connectors:
+      # Span metrics connector disabled for AWS
+      # Uncomment to generate RED metrics from traces
+      # spanmetrics:
+
+    service:
+      extensions: [health_check, sigv4auth/logs, sigv4auth/traces]
+      telemetry:
+        logs:
+          encoding: json
+        metrics:
+          level: detailed
+          readers:
+          - periodic:
+              exporter:
+                otlp:
+                  protocol: grpc
+                  endpoint: localhost:4317
+      pipelines:
+        # Logs pipeline - send to both CloudWatch and OpenSearch
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, resource, batch]
+          exporters: [otlphttp/logs, opensearch]
+        
+        # Traces pipeline - send to both X-Ray and Jaeger
+        # Span metrics connector disabled
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, resource, batch]
+          exporters: [otlphttp/traces, otlp/jaeger]
+        
+        # Metrics pipeline - send to Prometheus only
+        # CloudWatch Metrics (awsemf) disabled to reduce costs
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, filter/too_frequent, transform/collision, resourcedetection, resource, batch]
+          exporters: [prometheus]

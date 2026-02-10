@@ -1,0 +1,249 @@
+# AWS Application Signals Configuration for OpenTelemetry Demo
+# This configuration uses the AWS Application Signals collector image
+# and sends telemetry ONLY to AWS CloudWatch (no built-in monitoring tools)
+
+# Disable all built-in monitoring tools
+prometheus:
+  enabled: false
+grafana:
+  enabled: false
+opensearch:
+  enabled: false
+jaeger:
+  enabled: false
+
+components:
+  # Expose frontend via AWS LoadBalancer
+  frontend-proxy:
+    service:
+      type: LoadBalancer
+      annotations:
+        # Optional: Use internal load balancer
+        # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        # Optional: Use NLB instead of CLB
+        # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+opentelemetry-collector:
+  # Use AWS Application Signals collector image
+  image:
+    repository: public.ecr.aws/d8u3t5w4/appsignals-otel-collector
+    tag: latest
+    pullPolicy: Always
+
+  # Disable all default presets - Application Signals collector has limited components
+  presets:
+    kubernetesAttributes:
+      enabled: false
+    kubeletMetrics:
+      enabled: false
+    kubernetesEvents:
+      enabled: false
+    clusterMetrics:
+      enabled: false
+    logsCollection:
+      enabled: false
+    hostMetrics:
+      enabled: false
+
+  # Service account for IRSA (IAM Roles for Service Accounts)
+  # Note: The service account is created by eksctl with proper IAM role annotation
+  # Do NOT create it again in Helm or deployment will fail
+  serviceAccount:
+    create: false
+    name: "opentelemetry-demo-otelcol"
+    # The IAM role ARN annotation is automatically added by eksctl
+
+  command:
+    extraArgs: []
+
+  # Deployment mode (can be deployment, daemonset, or statefulset)
+  mode: deployment
+
+  # Resource limits for the collector
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 200m
+      memory: 400Mi
+
+  alternateConfig:
+    receivers:
+      # OTLP receiver for application telemetry
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # Application Signals specific receiver
+      otlp/application_signals:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4316
+
+    processors:
+      # AWS Application Signals processor
+      awsapplicationsignals:
+        resolvers:
+          - platform: eks
+
+      # Resource detection for AWS
+      resourcedetection:
+        detectors: [env, eks, ec2]
+        timeout: 10s
+        override: false
+
+      # Metrics transform for Application Signals JVM metrics
+      metricstransform/application_signals:
+        transforms:
+          # JVM CPU metrics
+          - include: jvm.cpu.recent_utilization
+            action: update
+            new_name: JVMCpuRecentUtilization
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          - include: jvm.cpu.time
+            action: update
+            new_name: JVMCpuTime
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          # JVM Memory metrics
+          - include: jvm.memory.heap.used
+            action: update
+            new_name: JVMMemoryHeapUsed
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          - include: jvm.memory.nonheap.used
+            action: update
+            new_name: JVMMemoryNonHeapUsed
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          # JVM Thread metrics
+          - include: jvm.threads.count
+            action: update
+            new_name: JVMThreadCount
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          # JVM GC metrics
+          - include: jvm.gc.collections.count
+            action: insert
+            new_name: JVMGCCount
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+          - include: jvm.gc.collections.elapsed
+            action: insert
+            new_name: JVMGCDuration
+            operations:
+              - action: add_label
+                new_label: Telemetry.Source
+                new_value: RuntimeMetric
+
+    exporters:
+      # AWS X-Ray exporter for traces using OTLP HTTP
+      otlphttp:
+        traces_endpoint: https://xray.us-west-2.amazonaws.com/v1/traces
+        compression: gzip
+        auth:
+          authenticator: sigv4auth
+
+      # CloudWatch EMF exporter for Application Signals metrics
+      awsemf/application_signals:
+        region: us-west-2
+        log_group_name: "/aws/application-signals/data"
+        namespace: "ApplicationSignals"
+        dimension_rollup_option: "NoDimensionRollup"
+        version: "1"
+        local_mode: true
+        metric_declarations:
+          - dimensions:
+              - [Environment, Service]
+            label_matchers:
+              - label_names:
+                  - Telemetry.Source
+                regex: '^RuntimeMetric$'
+            metric_name_selectors:
+              - '^.*$'
+
+      # CloudWatch EMF exporter for custom metrics
+      awsemf:
+        region: us-west-2
+        log_group_name: "/aws/application-signals/custom"
+        namespace: "ApplicationSignalsCustom"
+        dimension_rollup_option: "NoDimensionRollup"
+
+      # CloudWatch Logs exporter using OTLP HTTP
+      otlphttp/logs:
+        compression: gzip
+        logs_endpoint: https://logs.us-west-2.amazonaws.com/v1/logs
+        headers:
+          x-aws-log-group: /aws/otel-demo/application
+          x-aws-log-stream: default
+        auth:
+          authenticator: sigv4auth/logs
+
+    extensions:
+      # SigV4 authentication for X-Ray
+      sigv4auth:
+        region: "us-west-2"
+        service: "xray"
+
+      # SigV4 authentication for CloudWatch Logs
+      sigv4auth/logs:
+        region: "us-west-2"
+        service: "logs"
+
+      # AWS proxy extension
+      awsproxy:
+
+    service:
+      extensions: [sigv4auth, sigv4auth/logs, awsproxy]
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+      pipelines:
+        # Traces pipeline - send to X-Ray with Application Signals processing
+        traces:
+          receivers: [otlp, otlp/application_signals]
+          processors: [awsapplicationsignals, resourcedetection]
+          exporters: [otlphttp]
+
+        # Application Signals metrics pipeline
+        metrics/application_signals:
+          receivers: [otlp, otlp/application_signals]
+          processors: [metricstransform/application_signals, awsapplicationsignals, resourcedetection]
+          exporters: [awsemf/application_signals]
+
+        # Custom metrics pipeline
+        metrics:
+          receivers: [otlp]
+          processors: [resourcedetection]
+          exporters: [awsemf]
+
+        # Logs pipeline - send to CloudWatch Logs
+        logs:
+          receivers: [otlp]
+          processors: [resourcedetection]
+          exporters: [otlphttp/logs]

@@ -1,0 +1,23 @@
+# AWS EKS Deployment Configuration for OpenTelemetry Demo
+# Similar to GCP implementation but configured for AWS CloudWatch
+
+environments:
+  default:
+    values:
+      - namespace: otel-demo
+  production:
+    values:
+      - namespace: otel-demo
+
+---
+repositories:
+  - name: open-telemetry
+    url: https://open-telemetry.github.io/opentelemetry-helm-charts
+
+releases:
+  - name: opentelemetry-demo
+    namespace: "{{ .Values.namespace }}"
+    chart: open-telemetry/opentelemetry-demo
+    version: ~0.40.2
+    values:
+      - opentelemetry-demo-values.yaml

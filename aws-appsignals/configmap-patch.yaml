@@ -1,0 +1,170 @@
+# This patch removes unsupported components from the ConfigMap
+# for the AWS Application Signals collector image
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector
+  namespace: otel-demo
+data:
+  relay: |
+    exporters:
+      awsemf:
+        dimension_rollup_option: NoDimensionRollup
+        log_group_name: /aws/application-signals/custom
+        namespace: ApplicationSignalsCustom
+        region: us-west-2
+      awsemf/application_signals:
+        dimension_rollup_option: NoDimensionRollup
+        local_mode: true
+        log_group_name: /aws/application-signals/data
+        metric_declarations:
+        - dimensions:
+          - - Environment
+            - Service
+          label_matchers:
+          - label_names:
+            - Telemetry.Source
+            regex: ^RuntimeMetric$
+          metric_name_selectors:
+          - ^.*$
+        namespace: ApplicationSignals
+        region: us-west-2
+        version: "1"
+      otlphttp:
+        auth:
+          authenticator: sigv4auth
+        compression: gzip
+        traces_endpoint: https://xray.us-west-2.amazonaws.com/v1/traces
+      otlphttp/logs:
+        auth:
+          authenticator: sigv4auth/logs
+        compression: gzip
+        headers:
+          x-aws-log-group: /aws/otel-demo/application
+          x-aws-log-stream: default
+        logs_endpoint: https://logs.us-west-2.amazonaws.com/v1/logs
+    extensions:
+      awsproxy: null
+      sigv4auth:
+        region: us-west-2
+        service: xray
+      sigv4auth/logs:
+        region: us-west-2
+        service: logs
+    processors:
+      awsapplicationsignals:
+        resolvers:
+        - platform: eks
+      metricstransform/application_signals:
+        transforms:
+        - action: update
+          include: jvm.cpu.recent_utilization
+          new_name: JVMCpuRecentUtilization
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: update
+          include: jvm.cpu.time
+          new_name: JVMCpuTime
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: update
+          include: jvm.memory.heap.used
+          new_name: JVMMemoryHeapUsed
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: update
+          include: jvm.memory.nonheap.used
+          new_name: JVMMemoryNonHeapUsed
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: update
+          include: jvm.threads.count
+          new_name: JVMThreadCount
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: insert
+          include: jvm.gc.collections.count
+          new_name: JVMGCCount
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+        - action: insert
+          include: jvm.gc.collections.elapsed
+          new_name: JVMGCDuration
+          operations:
+          - action: add_label
+            new_label: Telemetry.Source
+            new_value: RuntimeMetric
+      resourcedetection:
+        detectors:
+        - env
+        - eks
+        - ec2
+        override: false
+        timeout: 10s
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      otlp/application_signals:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4316
+    service:
+      extensions:
+      - sigv4auth
+      - sigv4auth/logs
+      - awsproxy
+      pipelines:
+        logs:
+          exporters:
+          - otlphttp/logs
+          processors:
+          - resourcedetection
+          receivers:
+          - otlp
+        metrics:
+          exporters:
+          - awsemf
+          processors:
+          - resourcedetection
+          receivers:
+          - otlp
+        metrics/application_signals:
+          exporters:
+          - awsemf/application_signals
+          processors:
+          - metricstransform/application_signals
+          - awsapplicationsignals
+          - resourcedetection
+          receivers:
+          - otlp
+          - otlp/application_signals
+        traces:
+          exporters:
+          - otlphttp
+          processors:
+          - awsapplicationsignals
+          - resourcedetection
+          receivers:
+          - otlp
+          - otlp/application_signals
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
