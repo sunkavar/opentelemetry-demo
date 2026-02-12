@@ -1,8 +1,7 @@
-# AWS Application Signals Configuration for OpenTelemetry Demo
-# This configuration uses the AWS Application Signals collector image
-# and sends telemetry ONLY to AWS CloudWatch (no built-in monitoring tools)
+# OpenTelemetry Demo - AWS Application Signals Configuration
+# Uses AWS Application Signals collector image
+# Sends telemetry exclusively to AWS CloudWatch (built-in tools disabled)
 
-# Disable all built-in monitoring tools
 prometheus:
   enabled: false
 grafana:
@@ -13,24 +12,18 @@ jaeger:
   enabled: false
 
 components:
-  # Expose frontend via AWS LoadBalancer
   frontend-proxy:
     service:
       type: LoadBalancer
-      annotations:
-        # Optional: Use internal load balancer
-        # service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-        # Optional: Use NLB instead of CLB
-        # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
 
 opentelemetry-collector:
-  # Use AWS Application Signals collector image
+  # AWS Application Signals collector image
   image:
     repository: public.ecr.aws/d8u3t5w4/appsignals-otel-collector
     tag: latest
     pullPolicy: Always
 
-  # Disable all default presets - Application Signals collector has limited components
+  # Disable default presets (not supported by Application Signals collector)
   presets:
     kubernetesAttributes:
       enabled: false
@@ -45,9 +38,7 @@ opentelemetry-collector:
     hostMetrics:
       enabled: false
 
-  # Service account for IRSA (IAM Roles for Service Accounts)
-  # Note: The service account is created by eksctl with proper IAM role annotation
-  # Do NOT create it again in Helm or deployment will fail
+  # Service account created by eksctl with IRSA
   serviceAccount:
     create: false
     name: "opentelemetry-demo-otelcol"
@@ -59,7 +50,6 @@ opentelemetry-collector:
   # Deployment mode (can be deployment, daemonset, or statefulset)
   mode: deployment
 
-  # Resource limits for the collector
   resources:
     limits:
       cpu: 1000m
@@ -70,7 +60,6 @@ opentelemetry-collector:
 
   alternateConfig:
     receivers:
-      # OTLP receiver for application telemetry
       otlp:
         protocols:
           grpc:
@@ -78,28 +67,25 @@ opentelemetry-collector:
           http:
             endpoint: 0.0.0.0:4318
 
-      # Application Signals specific receiver
+      # Application Signals receiver
       otlp/application_signals:
         protocols:
           http:
             endpoint: 0.0.0.0:4316
 
     processors:
-      # AWS Application Signals processor
       awsapplicationsignals:
         resolvers:
           - platform: eks
 
-      # Resource detection for AWS
       resourcedetection:
         detectors: [env, eks, ec2]
         timeout: 10s
         override: false
 
-      # Metrics transform for Application Signals JVM metrics
+      # Transform JVM metrics for Application Signals
       metricstransform/application_signals:
         transforms:
-          # JVM CPU metrics
           - include: jvm.cpu.recent_utilization
             action: update
             new_name: JVMCpuRecentUtilization

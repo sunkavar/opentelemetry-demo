@@ -15,13 +15,13 @@ AWS Application Signals provides:
 
 This deployment uses a **hybrid approach** to work around Helm chart limitations:
 
-1. **Helm deploys** the OpenTelemetry Demo with all services
-2. **Automatic patching** removes unsupported components from the collector ConfigMap
-3. **Image update** switches to AWS Application Signals collector
-4. **RBAC setup** adds necessary Kubernetes permissions
+1. **RBAC setup** creates ClusterRole and ClusterRoleBinding for Kubernetes permissions
+2. **Helm deploys** the OpenTelemetry Demo with all services
+3. **Automatic patching** removes unsupported components from the collector ConfigMap
+4. **Image update** switches to AWS Application Signals collector
 5. **Health probe removal** since Application Signals collector doesn't support health_check extension
 
-All of this is automated in the `deploy.sh` script for a single-command deployment.
+All of this is automated in the `deploy.sh` script for a single-command deployment. The RBAC configuration is embedded directly in the deployment script.
 
 ### Why This Approach?
 
@@ -236,19 +236,10 @@ Should have annotation: `eks.amazonaws.com/role-arn: arn:aws:iam::...`
 ## Files
 
 - `opentelemetry-demo-values.yaml` - Helm values with Application Signals configuration
-- `setup-eks-cluster.sh` - Create EKS cluster
-- `setup-iam-permissions.sh` - Configure IAM roles for IRSA
-- `deploy.sh` - Deploy the demo
-- `cleanup.sh` - Clean up all resources
-
-## Files
-
-- `opentelemetry-demo-values.yaml` - Helm values with Application Signals configuration
 - `configmap-patch.yaml` - Patch to remove unsupported components from Helm-generated ConfigMap
-- `clusterrole.yaml` - RBAC permissions for Application Signals processor
 - `setup-eks-cluster.sh` - Create EKS cluster
 - `setup-iam-permissions.sh` - Configure IAM roles for IRSA
-- `deploy.sh` - **Main deployment script** (automated Helm + patching)
+- `deploy.sh` - Main deployment script (includes RBAC setup, Helm deployment, and patching)
 - `cleanup.sh` - Clean up all resources
 
 ## Key Differences from Standard Deployment

@@ -1,9 +1,12 @@
 #!/bin/bash
-# Setup EKS cluster for OpenTelemetry Demo
+# Setup EKS cluster for OpenTelemetry Demo with CloudWatch integration
+# Region: us-west-2
+
 set -e
 
+# Configuration
 export AWS_REGION=${AWS_REGION:-us-west-2}
-export CLUSTER_NAME=${CLUSTER_NAME:-otel-demo-cluster}
+export CLUSTER_NAME=${CLUSTER_NAME:-otel-demo}
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 echo "=========================================="
@@ -14,7 +17,8 @@ echo "Cluster Name: ${CLUSTER_NAME}"
 echo "AWS Account: ${AWS_ACCOUNT_ID}"
 echo "=========================================="
 
-echo "Creating EKS cluster (this will take 15-20 minutes)..."
+# Step 1: Create EKS cluster
+echo "Step 1: Creating EKS cluster (this will take 15-20 minutes)..."
 eksctl create cluster \
   --name ${CLUSTER_NAME} \
   --region ${AWS_REGION} \
@@ -27,8 +31,10 @@ eksctl create cluster \
   --managed \
   --with-oidc
 
-echo "Updating kubeconfig..."
+# Step 2: Update kubeconfig
+echo "Step 2: Updating kubeconfig..."
 aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
 
-echo "Verifying cluster access..."
+# Step 3: Verify cluster
+echo "Step 3: Verifying cluster access..."
 kubectl get nodes
