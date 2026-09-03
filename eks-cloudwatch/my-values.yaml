@@ -1,0 +1,255 @@
+# OpenTelemetry Demo on EKS -> CloudWatch OTLP endpoints
+#
+# Pure upstream components only:
+#   - chart:     open-telemetry/opentelemetry-demo 0.41.0 (appVersion 3.0.0)
+#   - collector: otel/opentelemetry-collector-contrib (chart default, unchanged)
+#   - SDKs:      unchanged demo SDKs
+# No ADOT, no CloudWatch agent, no custom images. sigv4authextension and the
+# otlphttp exporter both ship in collector-contrib.
+#
+# CloudWatch is added as an ADDITIONAL backend. Jaeger / Prometheus / OpenSearch
+# stay wired up so the built-in Grafana + Jaeger UIs keep working.
+#
+# Install:
+#   helm install my-otel-demo open-telemetry/opentelemetry-demo \
+#     -n otel-demo -f my-values.yaml
+#
+# ---------------------------------------------------------------------------
+# ONE THING TO CHANGE if you are not in us-east-1: the AWS_REGION value under
+# extraEnvs below. Everything else derives from it via ${env:AWS_REGION}.
+# ---------------------------------------------------------------------------
+
+# Side effect of the resourcedetection change below. The chart's Prometheus
+# promotes cloud.region, cloud.availability_zone, and k8s.cluster.name to labels
+# (see prometheus.server.otlp.promote_resource_attributes upstream). Those were
+# previously EMPTY, so once resourcedetection started populating them on every
+# datapoint, every existing series got a NEW identity. Cardinality effectively
+# doubled, and Prometheus OOMKilled repeatedly against its 400Mi chart default,
+# crash-looping through WAL replay before it settled.
+#
+# It self-recovered after 6 restarts, but raising the limit avoids the spike on
+# any future attribute change. Costs nothing on a 32 GB cluster.
+prometheus:
+  server:
+    resources:
+      limits:
+        memory: 1Gi
+      requests:
+        memory: 512Mi
+
+opentelemetry-collector:
+  # The collector pods need an IAM role so sigv4auth can sign requests.
+  #
+  # The ServiceAccount is REQUIRED and must not be removed. EKS Pod Identity
+  # binds an IAM role to a (namespace, service account) pair, so the SA is what
+  # the association targets. The chart sets fullnameOverride: otel-collector,
+  # so this SA is named otel-collector.
+  serviceAccount:
+    create: true
+    # Intentionally empty. With Pod Identity the role binding lives outside
+    # Kubernetes and is created with:
+    #   aws eks create-pod-identity-association \
+    #     --cluster-name <cluster> --namespace otel-demo \
+    #     --service-account otel-collector --role-arn <role>
+    annotations: {}
+
+  # Default limit is 400Mi. Three extra exporters with their own sending queues
+  # need more headroom, and memory_limiter is percentage-based off this limit.
+  resources:
+    limits:
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 512Mi
+
+  # Region for both the sigv4 signer and the endpoint URLs.
+  # REQUIRED, do not remove. EKS Pod Identity injects ONLY
+  # AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE.
+  # It does not set AWS_REGION, so the config below would fail to expand
+  # ${env:AWS_REGION} without this.
+  extraEnvs:
+    - name: AWS_REGION
+      value: us-east-1
+
+  config:
+    processors:
+      # The chart default is `detectors: [env, system]`, which stamps host.name
+      # and os.* but NO cloud or cluster identity. That left AWS context
+      # inconsistent: it only appeared on services whose SDK happens to do its
+      # own AWS detection (the Node.js ones did, .NET and PHP did not), and
+      # k8s.cluster.name was absent everywhere.
+      #
+      # That last one matters here. Every cluster in this account/region writes
+      # spans to the SAME `aws/spans` log group, so without k8s.cluster.name you
+      # cannot cleanly separate this demo from anything else running.
+      #
+      # `detectors` is a LIST, so Helm replaces it. env and system are repeated
+      # to preserve the chart's behaviour.
+      #
+      # Attributes gained (all telemetry, every language, uniformly):
+      #   eks -> cloud.provider, cloud.platform=aws_eks, k8s.cluster.name
+      #   ec2 -> cloud.region, cloud.account.id, cloud.availability_zone,
+      #          host.id, host.type, host.image.id
+      #
+      # REQUIREMENTS, both verified before enabling:
+      #   - IMDS reachable from pods. Needs HttpEndpoint=enabled and
+      #     HttpPutResponseHopLimit >= 2 on the nodes.
+      #   - ec2:DescribeInstances on the collector role, for k8s.cluster.name
+      #     only. See iam-policy.json.
+      #
+      # WARNING: a resource detector that FAILS stops the collector from
+      # starting, taking all telemetry with it. If IMDS is blocked in your
+      # environment, drop `ec2`/`eks` from this list rather than debugging a
+      # CrashLoopBackOff.
+      resourcedetection:
+        detectors: [env, system, eks, ec2]
+        # EKS detection can fall back to the Kubernetes and EC2 APIs, which is
+        # slower than IMDS. The docs recommend raising this from the 5s default.
+        timeout: 15s
+        eks:
+          resource_attributes:
+            # Off by default in the processor. This is the main reason for the
+            # eks detector here.
+            k8s.cluster.name:
+              enabled: true
+        ec2:
+          # Instance tags are NOT collected. Via the API they would need
+          # ec2:DescribeTags, and via IMDS they need InstanceMetadataTags
+          # enabled on the node, which is disabled here.
+          tags: []
+
+    extensions:
+      # One signer per service: each CloudWatch endpoint signs against a
+      # different SigV4 service name (xray / monitoring / logs).
+      sigv4auth/xray:
+        region: ${env:AWS_REGION}
+        service: xray
+      sigv4auth/monitoring:
+        region: ${env:AWS_REGION}
+        service: monitoring
+      sigv4auth/logs:
+        region: ${env:AWS_REGION}
+        service: logs
+
+    exporters:
+      # --- TRACES -> X-Ray OTLP endpoint --------------------------------------
+      # Requires Transaction Search enabled account-wide (see README step 2).
+      # Endpoint limits: 5 MB uncompressed / 10,000 spans / 200 KB per span.
+      # Signal-specific `traces_endpoint` is required: the URL already contains
+      # /v1/traces, and plain `endpoint` would append it a second time.
+      otlp_http/cw_traces:
+        traces_endpoint: https://xray.${env:AWS_REGION}.amazonaws.com/v1/traces
+        compression: gzip
+        auth:
+          authenticator: sigv4auth/xray
+        timeout: 30s
+        sending_queue:
+          enabled: true
+          # queue_size and batch sizes are both counted in items (spans here).
+          # 20k spans is roughly 40 MB buffered worst case, which fits the 1Gi
+          # limit alongside the other two queues.
+          sizer: items
+          queue_size: 20000
+          num_consumers: 8
+          batch:
+            flush_timeout: 5s
+            min_size: 200
+            # 1000 spans keeps us far inside BOTH the 10,000-span and the
+            # 5 MB caps at demo span sizes. Raise only if you watch for 400s.
+            max_size: 1000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+      # --- METRICS -> CloudWatch OTLP endpoint --------------------------------
+      # Endpoint limits: 1 MB uncompressed / 1,000 datapoints / 500 TPS account.
+      otlp_http/cw_metrics:
+        metrics_endpoint: https://monitoring.${env:AWS_REGION}.amazonaws.com/v1/metrics
+        compression: gzip
+        auth:
+          authenticator: sigv4auth/monitoring
+        timeout: 30s
+        sending_queue:
+          enabled: true
+          sizer: items
+          queue_size: 20000
+          num_consumers: 8
+          batch:
+            flush_timeout: 10s
+            min_size: 200
+            # Hard endpoint cap is 1,000 datapoints per request.
+            max_size: 900
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+      # --- LOGS -> CloudWatch Logs OTLP endpoint ------------------------------
+      # The log group AND stream must already exist (README step 3).
+      # Endpoint limits: 1 MB uncompressed / 10,000 records / 5,000 TPS.
+      otlp_http/cw_logs:
+        logs_endpoint: https://logs.${env:AWS_REGION}.amazonaws.com/v1/logs
+        compression: gzip
+        headers:
+          x-aws-log-group: /otel-demo/application
+          x-aws-log-stream: otel-collector
+        auth:
+          authenticator: sigv4auth/logs
+        timeout: 30s
+        sending_queue:
+          enabled: true
+          sizer: items
+          queue_size: 20000
+          num_consumers: 8
+          batch:
+            flush_timeout: 5s
+            min_size: 200
+            # Well inside the 10,000-record cap; the binding limit here is the
+            # 1 MB uncompressed request size.
+            max_size: 1000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+    service:
+      # This is a LIST, so Helm replaces it wholesale. health_check and opamp
+      # are chart defaults and must be repeated or the collector fails to start.
+      extensions:
+        - health_check
+        - opamp
+        - sigv4auth/xray
+        - sigv4auth/monitoring
+        - sigv4auth/logs
+
+      pipelines:
+        # Exporter lists are REPLACED, not merged. Upstream names are repeated
+        # so Jaeger / Prometheus / OpenSearch keep receiving data.
+        # `receivers` and `processors` are intentionally omitted so the chart
+        # defaults (and the hostMetrics/kubeletMetrics/clusterMetrics presets)
+        # stay intact.
+        traces:
+          # RECOMMENDED, but a deviation from chart defaults. Chart 0.41.0 wires
+          # `transform/sanitize_logs` into the traces pipeline and never uses
+          # `transform/sanitize_spans` anywhere, so span names are NOT normalized.
+          # That inflates span_metrics cardinality, which you pay for in
+          # CloudWatch. Uncomment to apply the span sanitizer the chart defines
+          # but forgets to use. Verify against `helm show values` if you change
+          # chart versions, since this list must be repeated in full.
+          # processors:
+          #   - k8s_attributes
+          #   - memory_limiter
+          #   - resourcedetection
+          #   - resource
+          #   - transform/sanitize_spans
+          #   - gen_ai_normalizer
+          exporters: [otlp_grpc/jaeger, debug, span_metrics, otlp_http/cw_traces]
+        metrics:
+          exporters: [otlp_http/prometheus, debug, otlp_http/cw_metrics]
+        logs:
+          exporters: [opensearch, debug, otlp_http/cw_logs]
+        # profiles: left untouched. CloudWatch has no OTLP profiles endpoint.

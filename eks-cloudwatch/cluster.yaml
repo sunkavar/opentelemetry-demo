@@ -1,0 +1,57 @@
+# Dedicated cluster for the OpenTelemetry demo.
+#
+#   eksctl create cluster -f cluster.yaml
+#
+# Region is us-east-1 to match where Transaction Search is already ACTIVE and
+# where the /otel-demo/application log group lives.
+#
+# Sizing rationale: the demo needs roughly 6 GB RAM and 4-6 vCPU once the load
+# generator is running, and the rendered chart requests 1400m CPU / 1124Mi with
+# memory limits totalling ~10.7 GB. Two m5.xlarge gives 8 vCPU and 32 GB, which
+# leaves real headroom. Deliberately NOT burstable (t3), so there is no CPU
+# credit surcharge under the demo's continuous synthetic load.
+#
+# No `iam.withOIDC` on purpose. This cluster uses EKS Pod Identity, which needs
+# no OIDC provider. The collector's IAM role already exists with a
+# pods.eks.amazonaws.com trust policy and is reusable across clusters.
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: otel-demo-cluster
+  region: us-east-1
+  version: "1.33"
+  tags:
+    purpose: opentelemetry-demo
+    owner: sunkavar
+    delete-after: on-demand
+
+# Pod Identity Agent is required for the collector to get credentials.
+# Also pinning the standard trio so the cluster comes up fully functional.
+addons:
+  - name: eks-pod-identity-agent
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+
+managedNodeGroups:
+  - name: demo-ng
+    instanceType: m5.xlarge
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 3
+    volumeSize: 50
+    volumeType: gp3
+    amiFamily: AmazonLinux2023
+    privateNetworking: false
+    labels:
+      workload: otel-demo
+    tags:
+      purpose: opentelemetry-demo
+
+cloudWatch:
+  clusterLogging:
+    # Keep control plane logging off to avoid extra CloudWatch Logs cost on a
+    # throwaway demo cluster. Add "api" and "audit" here if you need them.
+    enableTypes: []
